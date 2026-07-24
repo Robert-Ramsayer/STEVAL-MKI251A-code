@@ -9,7 +9,8 @@ Also the diagram for the Rasp. Pi. Page 5 in the book:
 https://pip-assets.raspberrypi.com/categories/686-raspberry-pi-pico-w/documents/RP-008312-DS-1-pico-w-datasheet.pdf?disposition=inline
 
 As for which wires: 
-VDD    → 3V3
+
+VDD    → 3V3 
 
 VDDIO  → 3V3
 
