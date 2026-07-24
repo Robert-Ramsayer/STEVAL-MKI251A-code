@@ -1,0 +1,481 @@
+#include <Wire.h>
+#include <math.h>
+
+// =====================
+// Pico I2C pins
+// =====================
+#define SDA_PIN 4
+#define SCL_PIN 5
+
+// =====================
+// LSM6DSV320X I2C setup
+// =====================
+#define IMU_ADDR 0x6A
+
+#define REG_WHO_AM_I 0x0F
+
+// Main control registers
+#define REG_CTRL1       0x10   // low-g accel control
+#define REG_CTRL2       0x11   // gyro control
+#define REG_CTRL3       0x12
+#define REG_CTRL4       0x13
+#define REG_CTRL5       0x14
+#define REG_CTRL6       0x15
+#define REG_CTRL7       0x16
+#define REG_CTRL8       0x17
+#define REG_CTRL9       0x18
+#define REG_CTRL10      0x19
+
+#define REG_STATUS      0x1E
+
+// Output registers
+#define REG_OUTX_L_G    0x22   // gyro output start
+#define REG_OUTX_L_HG   0x34   // high-g accel output start
+
+// High-g control registers
+#define REG_CTRL2_XL_HG 0x4D
+#define REG_CTRL1_XL_HG 0x4E
+
+// =====================
+// Scales
+// =====================
+
+// High-g channel: +/-320 g.
+// Requires CTRL1_XL_HG = 0x9C.
+const float HIGH_G_FULL_SCALE_G = 320.0;
+
+// Gyro: +/-2000 dps.
+// Requires CTRL6 gyro FS bits and CTRL2_G working mode.
+const float GYRO_FULL_SCALE_DPS = 2000.0;
+
+// =====================
+// Detection thresholds
+// =====================
+
+// For desk / hand testing, 5 g is useful.
+// For bag testing later, maybe 10 g to 20 g depending on noise and mounting.
+const float HIGH_G_PUNCH_THRESHOLD_G = 5.0;
+
+// Rotation threshold. This is just a marker, not final physics.
+const float GYRO_ROTATION_THRESHOLD_DPS = 150.0;
+
+// Baseline calibration time
+const unsigned long CALIBRATION_TIME_MS = 3000;
+
+// Print interval.
+// 5 ms gives a much better chance of catching impact peaks than 50 ms.
+const unsigned long PRINT_INTERVAL_MS = 5;
+
+// =====================
+// Baselines
+// =====================
+float base_hgx_g = 0.0;
+float base_hgy_g = 0.0;
+float base_hgz_g = 0.0;
+
+float base_gx_dps = 0.0;
+float base_gy_dps = 0.0;
+float base_gz_dps = 0.0;
+
+unsigned long lastPrintMs = 0;
+
+// =====================
+// Basic I2C helpers
+// =====================
+byte writeRegister(byte reg, byte value) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  byte error = Wire.endTransmission();
+
+  Serial.print("Write reg 0x");
+  Serial.print(reg, HEX);
+  Serial.print(" = 0x");
+  Serial.print(value, HEX);
+  Serial.print("   error = ");
+  Serial.println(error);
+
+  return error;
+}
+
+byte readRegister(byte reg) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  byte error = Wire.endTransmission();
+
+  if (error != 0) {
+    Serial.print("Register select error for 0x");
+    Serial.print(reg, HEX);
+    Serial.print(" = ");
+    Serial.println(error);
+    return 0xFF;
+  }
+
+  int received = Wire.requestFrom(IMU_ADDR, (byte)1);
+
+  if (received != 1) {
+    Serial.print("Expected 1 byte from 0x");
+    Serial.print(reg, HEX);
+    Serial.print(", got ");
+    Serial.println(received);
+    return 0xFE;
+  }
+
+  return Wire.read();
+}
+
+bool readBytes(byte startReg, byte *buffer, int count) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(startReg);
+  byte error = Wire.endTransmission();
+
+  if (error != 0) {
+    Serial.print("Read register select error at 0x");
+    Serial.print(startReg, HEX);
+    Serial.print(" = ");
+    Serial.println(error);
+    return false;
+  }
+
+  int received = Wire.requestFrom(IMU_ADDR, (byte)count);
+
+  if (received != count) {
+    Serial.print("Expected ");
+    Serial.print(count);
+    Serial.print(" bytes from 0x");
+    Serial.print(startReg, HEX);
+    Serial.print(", got ");
+    Serial.println(received);
+    return false;
+  }
+
+  for (int i = 0; i < count; i++) {
+    buffer[i] = Wire.read();
+  }
+
+  return true;
+}
+
+bool read3AxisRaw(byte startReg, int16_t &x, int16_t &y, int16_t &z) {
+  byte b[6];
+
+  if (!readBytes(startReg, b, 6)) {
+    return false;
+  }
+
+  // ST output registers are low byte first, then high byte.
+  x = (int16_t)((b[1] << 8) | b[0]);
+  y = (int16_t)((b[3] << 8) | b[2]);
+  z = (int16_t)((b[5] << 8) | b[4]);
+
+  return true;
+}
+
+// =====================
+// Sensor configuration
+// =====================
+void configureSensor() {
+  Serial.println("Configuring high-g + gyro. Low-g OFF.");
+
+  // Start from a quiet, known state.
+  writeRegister(REG_CTRL1, 0x00);        // normal low-g accel OFF
+  writeRegister(REG_CTRL7, 0x00);
+  writeRegister(REG_CTRL2, 0x00);        // gyro OFF first
+  writeRegister(REG_CTRL8, 0x00);
+  writeRegister(REG_CTRL3, 0x44);        // BDU + auto-increment
+  writeRegister(REG_CTRL9, 0x00);
+  writeRegister(REG_CTRL4, 0x00);
+  writeRegister(REG_CTRL10, 0x00);
+  writeRegister(REG_CTRL5, 0x00);
+
+  // High-g setup, copied from the known-good high-g-only sketch.
+  writeRegister(REG_CTRL2_XL_HG, 0x00);
+
+  // CTRL6:
+  // 0x08 was needed in the known-good high-g-only setup.
+  // 0x04 was needed for gyro +/-2000 dps in earlier gyro testing.
+  // 0x0C combines those two bits.
+  writeRegister(REG_CTRL6, 0x0C);
+
+  // High-g: output enabled, 480 Hz, +/-320 g.
+  writeRegister(REG_CTRL1_XL_HG, 0x9C);
+
+  delay(100);
+
+  // Gyro:
+  // CTRL2_G = 0x06 was the working gyro setting:
+  // OP_MODE_G = 000 high-performance
+  // ODR_G = 0110, 120 Hz
+  writeRegister(REG_CTRL2, 0x06);
+
+  delay(500);
+}
+
+// =====================
+// Read converted values
+// =====================
+bool readHighGAndGyro(float &hgx_g, float &hgy_g, float &hgz_g,
+                      float &gx_dps, float &gy_dps, float &gz_dps,
+                      int16_t &hgx_raw, int16_t &hgy_raw, int16_t &hgz_raw,
+                      int16_t &gx_raw, int16_t &gy_raw, int16_t &gz_raw) {
+  bool okGyro = read3AxisRaw(REG_OUTX_L_G, gx_raw, gy_raw, gz_raw);
+  bool okHigh = read3AxisRaw(REG_OUTX_L_HG, hgx_raw, hgy_raw, hgz_raw);
+
+  if (!okGyro || !okHigh) {
+    return false;
+  }
+
+  hgx_g = hgx_raw * (HIGH_G_FULL_SCALE_G / 32768.0);
+  hgy_g = hgy_raw * (HIGH_G_FULL_SCALE_G / 32768.0);
+  hgz_g = hgz_raw * (HIGH_G_FULL_SCALE_G / 32768.0);
+
+  gx_dps = gx_raw * (GYRO_FULL_SCALE_DPS / 32768.0);
+  gy_dps = gy_raw * (GYRO_FULL_SCALE_DPS / 32768.0);
+  gz_dps = gz_raw * (GYRO_FULL_SCALE_DPS / 32768.0);
+
+  return true;
+}
+
+// =====================
+// Calibration
+// =====================
+void calibrateBaselines() {
+  Serial.println("Calibrating baselines.");
+  Serial.println("Keep the sensor still...");
+
+  unsigned long startMs = millis();
+
+  double sum_hgx = 0.0;
+  double sum_hgy = 0.0;
+  double sum_hgz = 0.0;
+
+  double sum_gx = 0.0;
+  double sum_gy = 0.0;
+  double sum_gz = 0.0;
+
+  int count = 0;
+
+  while (millis() - startMs < CALIBRATION_TIME_MS) {
+    float hgx, hgy, hgz;
+    float gx, gy, gz;
+
+    int16_t hgx_raw, hgy_raw, hgz_raw;
+    int16_t gx_raw, gy_raw, gz_raw;
+
+    if (readHighGAndGyro(hgx, hgy, hgz,
+                         gx, gy, gz,
+                         hgx_raw, hgy_raw, hgz_raw,
+                         gx_raw, gy_raw, gz_raw)) {
+      sum_hgx += hgx;
+      sum_hgy += hgy;
+      sum_hgz += hgz;
+
+      sum_gx += gx;
+      sum_gy += gy;
+      sum_gz += gz;
+
+      count++;
+    }
+
+    delay(5);
+  }
+
+  if (count == 0) {
+    Serial.println("Calibration failed. No samples read.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  base_hgx_g = sum_hgx / count;
+  base_hgy_g = sum_hgy / count;
+  base_hgz_g = sum_hgz / count;
+
+  base_gx_dps = sum_gx / count;
+  base_gy_dps = sum_gy / count;
+  base_gz_dps = sum_gz / count;
+
+  Serial.println("Calibration complete.");
+  Serial.print("Samples: ");
+  Serial.println(count);
+
+  Serial.print("High-g baseline: ");
+  Serial.print(base_hgx_g, 4);
+  Serial.print(",");
+  Serial.print(base_hgy_g, 4);
+  Serial.print(",");
+  Serial.println(base_hgz_g, 4);
+
+  Serial.print("Gyro baseline: ");
+  Serial.print(base_gx_dps, 4);
+  Serial.print(",");
+  Serial.print(base_gy_dps, 4);
+  Serial.print(",");
+  Serial.println(base_gz_dps, 4);
+}
+
+// =====================
+// Arduino setup / loop
+// =====================
+void setup() {
+  Serial.begin(115200);
+
+  unsigned long startWait = millis();
+  while (!Serial && millis() - startWait < 10000) {
+    delay(100);
+  }
+
+  Serial.println();
+  Serial.println("LSM6DSV320X high-g + gyro test");
+  Serial.println("High-g: +/-320 g");
+  Serial.println("Gyro: +/-2000 dps");
+  Serial.println("Low-g: OFF");
+
+  Wire.setSDA(SDA_PIN);
+  Wire.setSCL(SCL_PIN);
+  Wire.begin();
+  Wire.setClock(100000);
+
+  delay(500);
+
+  byte who = readRegister(REG_WHO_AM_I);
+
+  Serial.print("WHO_AM_I = 0x");
+  Serial.println(who, HEX);
+
+  if (who != 0x73) {
+    Serial.println("Unexpected WHO_AM_I. Stop and check wiring.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  configureSensor();
+
+  Serial.println();
+  Serial.println("Register readback:");
+  Serial.print("CTRL1 low-g accel = 0x");
+  Serial.println(readRegister(REG_CTRL1), HEX);
+  Serial.print("CTRL2 gyro        = 0x");
+  Serial.println(readRegister(REG_CTRL2), HEX);
+  Serial.print("CTRL3             = 0x");
+  Serial.println(readRegister(REG_CTRL3), HEX);
+  Serial.print("CTRL6             = 0x");
+  Serial.println(readRegister(REG_CTRL6), HEX);
+  Serial.print("CTRL8 low-g FS    = 0x");
+  Serial.println(readRegister(REG_CTRL8), HEX);
+  Serial.print("CTRL1_XL_HG       = 0x");
+  Serial.println(readRegister(REG_CTRL1_XL_HG), HEX);
+  Serial.print("CTRL2_XL_HG       = 0x");
+  Serial.println(readRegister(REG_CTRL2_XL_HG), HEX);
+
+  // Throw away first sample after startup.
+  float hgx, hgy, hgz;
+  float gx, gy, gz;
+  int16_t hgx_raw, hgy_raw, hgz_raw;
+  int16_t gx_raw, gy_raw, gz_raw;
+
+  readHighGAndGyro(hgx, hgy, hgz,
+                   gx, gy, gz,
+                   hgx_raw, hgy_raw, hgz_raw,
+                   gx_raw, gy_raw, gz_raw);
+
+  calibrateBaselines();
+
+  Serial.println();
+  Serial.println("CSV:");
+  Serial.println("time_ms,status,hgx_raw,hgy_raw,hgz_raw,hgx_g,hgy_g,hgz_g,hg_dyn_g,gx_raw,gy_raw,gz_raw,gx_dps,gy_dps,gz_dps,gyro_dyn_dps,is_punch,is_rotation");
+}
+
+void loop() {
+  unsigned long nowMs = millis();
+
+  if (nowMs - lastPrintMs < PRINT_INTERVAL_MS) {
+    return;
+  }
+
+  lastPrintMs = nowMs;
+
+  float hgx, hgy, hgz;
+  float gx, gy, gz;
+
+  int16_t hgx_raw, hgy_raw, hgz_raw;
+  int16_t gx_raw, gy_raw, gz_raw;
+
+  byte status = readRegister(REG_STATUS);
+
+  if (!readHighGAndGyro(hgx, hgy, hgz,
+                        gx, gy, gz,
+                        hgx_raw, hgy_raw, hgz_raw,
+                        gx_raw, gy_raw, gz_raw)) {
+    Serial.println("READ_FAILED");
+    return;
+  }
+
+  // Baseline-subtracted dynamic values.
+  float dhgx = hgx - base_hgx_g;
+  float dhgy = hgy - base_hgy_g;
+  float dhgz = hgz - base_hgz_g;
+
+  float dgx = gx - base_gx_dps;
+  float dgy = gy - base_gy_dps;
+  float dgz = gz - base_gz_dps;
+
+  float hg_dyn_g = sqrt(dhgx * dhgx + dhgy * dhgy + dhgz * dhgz);
+  float gyro_dyn_dps = sqrt(dgx * dgx + dgy * dgy + dgz * dgz);
+
+  int is_punch = 0;
+  int is_rotation = 0;
+
+  if (hg_dyn_g >= HIGH_G_PUNCH_THRESHOLD_G) {
+    is_punch = 1;
+  }
+
+  if (gyro_dyn_dps >= GYRO_ROTATION_THRESHOLD_DPS) {
+    is_rotation = 1;
+  }
+
+  Serial.print(nowMs);
+  Serial.print(",");
+
+  Serial.print("0x");
+  Serial.print(status, HEX);
+  Serial.print(",");
+
+  Serial.print(hgx_raw);
+  Serial.print(",");
+  Serial.print(hgy_raw);
+  Serial.print(",");
+  Serial.print(hgz_raw);
+  Serial.print(",");
+
+  Serial.print(hgx, 4);
+  Serial.print(",");
+  Serial.print(hgy, 4);
+  Serial.print(",");
+  Serial.print(hgz, 4);
+  Serial.print(",");
+  Serial.print(hg_dyn_g, 4);
+  Serial.print(",");
+
+  Serial.print(gx_raw);
+  Serial.print(",");
+  Serial.print(gy_raw);
+  Serial.print(",");
+  Serial.print(gz_raw);
+  Serial.print(",");
+
+  Serial.print(gx, 2);
+  Serial.print(",");
+  Serial.print(gy, 2);
+  Serial.print(",");
+  Serial.print(gz, 2);
+  Serial.print(",");
+  Serial.print(gyro_dyn_dps, 2);
+  Serial.print(",");
+
+  Serial.print(is_punch);
+  Serial.print(",");
+
+  Serial.println(is_rotation);
+}
