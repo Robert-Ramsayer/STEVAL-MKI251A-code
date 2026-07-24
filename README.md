@@ -10,9 +10,15 @@ https://pip-assets.raspberrypi.com/categories/686-raspberry-pi-pico-w/documents/
 
 As for which wires: 
 VDD    → 3V3
+
 VDDIO  → 3V3
+
 GND    → GND
+
 SDA    → GP4
+
 SCL    → GP5
+
 CS     → 3V3
+
 SDO    → GND
